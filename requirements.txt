@@ -1,2 +1,2 @@
-python-telegram-bot
-instaloader
+python-telegram-bot>=20.0
+instaloader>=4.0
