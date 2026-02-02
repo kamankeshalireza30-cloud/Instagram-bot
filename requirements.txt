@@ -1,0 +1,2 @@
+python-telegram-bot==20.7
+instaloader==4.11.0
