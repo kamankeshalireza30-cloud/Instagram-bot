@@ -1,3 +1,10 @@
-python-telegram-bot==20.7
-yt-dlp==2023.11.16
-moviepy==1.0.3
+# Core dependencies
+python-telegram-bot>=20.0  # Telegram Bot API wrapper
+instaloader>=4.9           # Instagram downloader
+aiohttp>=3.8.0             # Async HTTP client
+tenacity>=8.0.0            # Retry mechanism
+python-dotenv>=1.0.0       # Environment variables
+
+# Optional for better performance
+uvloop>=0.17.0              # Faster event loop (Unix only)
+orjson>=3.8.0               # Fast JSON processing

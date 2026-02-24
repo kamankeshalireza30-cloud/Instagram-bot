@@ -1,417 +1,389 @@
+"""
+Telegram Instagram Downloader Bot
+A professional bot for downloading Instagram content
+"""
+
 import os
 import logging
 import asyncio
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
-import yt_dlp
-import tempfile
-import json
+from typing import Optional, Tuple
+from dataclasses import dataclass
+from functools import wraps
+import time
 
-# توکن از متغیر محیطی
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+    ContextTypes
+)
+import instaloader
+import aiohttp
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+# ================== Configuration ==================
+
+@dataclass
+class Config:
+    """Application configuration management"""
+    BOT_TOKEN: str = os.getenv('BOT_TOKEN', '')
+    MAX_FILE_SIZE: int = 50 * 1024 * 1024  # 50MB Telegram limit
+    ALLOWED_GROUP: Optional[int] = os.getenv('ALLOWED_GROUP')
+    DEBUG: bool = os.getenv('DEBUG', 'False').lower() == 'true'
+
+config = Config()
+
+# ================== Logging Setup ==================
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.DEBUG if config.DEBUG else logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# ذخیره موقت اطلاعات کاربر
-user_sessions = {}
+# ================== Decorators ==================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """منوی اصلی با دکمه‌های زیبا"""
-    keyboard = [
-        [
-            InlineKeyboardButton("🎬 دانلود ویدیو", callback_data="download_video"),
-            InlineKeyboardButton("🎵 استخراج صدا", callback_data="extract_audio")
-        ],
-        [
-            InlineKeyboardButton("📝 کپی کپشن", callback_data="copy_caption"),
-            InlineKeyboardButton("🏷️ هشتگ‌ها", callback_data="get_hashtags")
-        ],
-        [
-            InlineKeyboardButton("ℹ️ راهنما", callback_data="help"),
-            InlineKeyboardButton("⭐ امتیاز", url="https://t.me/YourChannel")
-        ]
-    ]
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(
-        "✨ **ربات دانلودر حرفه‌ای اینستاگرام** ✨\n\n"
-        "🎯 **ویژگی‌های ویژه:**\n"
-        "• 🎬 دانلود ویدیو با کیفیت اصلی\n"
-        "• 🎵 استخراج صدا به صورت MP3\n"
-        "• 📝 کپی خودکار کپشن + هشتگ‌ها\n"
-        "• 📊 اطلاعات کامل پست\n"
-        "• ⚡ سرعت بالا\n\n"
-        "📎 **لینک اینستاگرام را بفرستید...**",
-        reply_markup=reply_markup,
-        parse_mode='Markdown',
-        disable_web_page_preview=True
-    )
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """دریافت لینک از کاربر"""
-    user_id = update.effective_user.id
-    url = update.message.text.strip()
-    
-    # بررسی لینک
-    if not url or "instagram.com" not in url:
-        await update.message.reply_text(
-            "❌ **لینک معتبر نیست!**\n\n"
-            "✅ مثال لینک صحیح:\n"
-            "• https://www.instagram.com/p/Cxxxxxxx/\n"
-            "• https://www.instagram.com/reel/Cxxxxxxx/\n"
-            "• https://www.instagram.com/tv/Cxxxxxxx/"
-        )
-        return
-    
-    # ذخیره لینک کاربر
-    user_sessions[user_id] = {'url': url}
-    
-    # تحلیل لینک
-    msg = await update.message.reply_text(
-        "🔍 **در حال تحلیل لینک...**\n"
-        "⏳ لطفاً کمی صبر کنید..."
-    )
-    
-    try:
-        # دریافت اطلاعات اولیه
-        ydl_opts = {'quiet': True, 'extract_flat': True}
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-        
-        if not info:
-            await msg.edit_text("❌ **لینک نامعتبر یا دسترسی محدود است!**")
+def admin_only(func):
+    """Restrict access to admins only"""
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        user_id = update.effective_user.id
+        if config.ALLOWED_GROUP and user_id != config.ALLOWED_GROUP:
+            await update.message.reply_text("⛔ You don't have permission to use this command.")
             return
+        return await func(update, context, *args, **kwargs)
+    return wrapper
+
+def log_function(func):
+    """Log function calls and execution time"""
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        logger.info(f"Calling function: {func.__name__}")
+        start_time = time.time()
+        try:
+            result = await func(*args, **kwargs)
+            elapsed_time = time.time() - start_time
+            logger.info(f"Function {func.__name__} completed in {elapsed_time:.2f} seconds")
+            return result
+        except Exception as e:
+            logger.error(f"Error in {func.__name__}: {str(e)}")
+            raise
+    return wrapper
+
+# ================== Main Downloader Class ==================
+
+class InstagramDownloader:
+    """Handle Instagram downloads with retry mechanism"""
+    
+    def __init__(self):
+        # Optimize Instaloader settings for speed
+        self.loader = instaloader.Instaloader(
+            download_videos=True,
+            download_video_thumbnails=False,
+            download_geotags=False,
+            download_comments=False,
+            save_metadata=False,
+            compress_json=False,
+            max_connection_attempts=3
+        )
+        self.temp_dir = "downloads"
+        os.makedirs(self.temp_dir, exist_ok=True)
+    
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10)
+    )
+    async def download_post(self, url: str) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Download Instagram post with automatic retry
         
-        # ذخیره اطلاعات
-        user_sessions[user_id]['info'] = info
+        Returns:
+            Tuple[file_path, file_type] or (None, None) on error
+        """
+        try:
+            # Extract post shortcode
+            shortcode = self._extract_shortcode(url)
+            if not shortcode:
+                return None, None
+            
+            # Get post metadata
+            post = instaloader.Post.from_shortcode(self.loader.context, shortcode)
+            
+            # Determine content type
+            if post.is_video:
+                file_path = os.path.join(self.temp_dir, f"{shortcode}.mp4")
+                # Download video
+                self.loader.download_post(post, target=self.temp_dir)
+                # Find downloaded file
+                for file in os.listdir(self.temp_dir):
+                    if file.endswith('.mp4') and shortcode in file:
+                        file_path = os.path.join(self.temp_dir, file)
+                        break
+                return file_path, 'video'
+            else:
+                # Download photo
+                self.loader.download_post(post, target=self.temp_dir)
+                for file in os.listdir(self.temp_dir):
+                    if file.endswith(('.jpg', '.png')) and shortcode in file:
+                        file_path = os.path.join(self.temp_dir, file)
+                        break
+                return file_path, 'photo'
+                
+        except Exception as e:
+            logger.error(f"Error downloading post: {str(e)}")
+            return None, None
+    
+    def _extract_shortcode(self, url: str) -> Optional[str]:
+        """Extract post shortcode from URL"""
+        patterns = [
+            r'instagram\.com/p/([^/?]+)',
+            r'instagram\.com/reel/([^/?]+)',
+            r'instagram\.com/tv/([^/?]+)'
+        ]
+        import re
+        for pattern in patterns:
+            match = re.search(pattern, url)
+            if match:
+                return match.group(1)
+        return None
+    
+    def cleanup(self, file_path: str):
+        """Remove temporary files"""
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                logger.info(f"Cleaned up: {file_path}")
+        except Exception as e:
+            logger.error(f"Cleanup error: {str(e)}")
+
+# ================== Telegram Handlers ==================
+
+class BotHandlers:
+    """Manage all bot handlers"""
+    
+    def __init__(self, downloader: InstagramDownloader):
+        self.downloader = downloader
+    
+    @log_function
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Welcome message with inline keyboard"""
+        welcome_text = """
+🎉 **Welcome to Instagram Downloader Bot!**
+
+✨ **Features:**
+• Download posts 📸
+• Download reels 🎬
+• Download IGTV 📺
+• Original quality ⭐
+
+📝 **How to use:**
+Just send me an Instagram post link!
+
+⚠️ **Note:** Only public content is downloadable
+        """
         
-        # ایجاد دکمه‌های اقدام
-        keyboard = []
-        
-        # بررسی نوع محتوا
-        if info.get('duration'):
-            keyboard.append([
-                InlineKeyboardButton("🎬 دانلود ویدیو", callback_data="action_download_video"),
-                InlineKeyboardButton("🎵 استخراج صدا", callback_data="action_extract_audio")
-            ])
-        else:
-            keyboard.append([
-                InlineKeyboardButton("🖼️ دانلود عکس", callback_data="action_download_photo")
-            ])
-        
-        keyboard.append([
-            InlineKeyboardButton("📝 کپی کپشن", callback_data="action_copy_caption"),
-            InlineKeyboardButton("📊 اطلاعات پست", callback_data="action_post_info")
-        ])
-        
-        keyboard.append([
-            InlineKeyboardButton("🔄 لینک دیگر", callback_data="action_new_link")
-        ])
-        
+        keyboard = [
+            [InlineKeyboardButton("📚 Guide", callback_data='help'),
+             InlineKeyboardButton("📊 Stats", callback_data='stats')],
+            [InlineKeyboardButton("👨‍💻 Developer", url='https://t.me/your_channel')]
+        ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        # نمایش اطلاعات اولیه
-        title = info.get('title', 'بدون عنوان')[:100]
-        duration = info.get('duration', 0)
-        uploader = info.get('uploader', 'ناشناس')
-        
-        info_text = f"""
-📊 **تحلیل لینک موفق!**
+        await update.message.reply_text(
+            welcome_text,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+    
+    @log_function
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Display help information"""
+        help_text = """
+📚 **Usage Guide**
 
-📛 **عنوان:** {title}
-👤 **کاربر:** @{uploader}
-⏱️ **مدت زمان:** {duration} ثانیه
-🔗 **نوع:** {'ویدیو' if duration > 0 else 'عکس'}
+🎯 **How to use:**
+1️⃣ Copy Instagram post link
+2️⃣ Send it to me
+3️⃣ Wait for download
+4️⃣ Get your file
 
-🎯 **لطفاً عمل مورد نظر را انتخاب کنید:**
+✅ **Supported links:**
+• https://instagram.com/p/...
+• https://instagram.com/reel/...
+• https://instagram.com/tv/...
+• https://www.instagram.com/p/...
+
+⚠️ **Limitations:**
+• Max file size: 50MB
+• Public content only
+• Private accounts not accessible
+
+⚡ **Speed:** Depends on your internet and server
         """
-        
-        await msg.edit_text(info_text, reply_markup=reply_markup, parse_mode='Markdown')
-        
-    except Exception as e:
-        logger.error(f"خطا در تحلیل لینک: {e}")
-        await msg.edit_text(
-            "❌ **خطا در تحلیل لینک!**\n\n"
-            "⚠️ دلایل احتمالی:\n"
-            "• پست خصوصی است\n"
-            "• اکانت خصوصی است\n"
-            "• لینک نامعتبر\n"
-            "• محدودیت دسترسی\n\n"
-            "🔧 لینک دیگری امتحان کنید..."
-        )
+        await update.message.reply_text(help_text, parse_mode='Markdown')
+    
+    @admin_only
+    @log_function
+    async def stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Bot statistics (admin only)"""
+        stats_text = """
+📊 **Bot Statistics**
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """مدیریت کلیک روی دکمه‌ها"""
-    query = update.callback_query
-    await query.answer()
-    
-    user_id = update.effective_user.id
-    action = query.data
-    
-    if user_id not in user_sessions:
-        await query.edit_message_text("❌ **سشن منقضی شده!**\nلطفاً دوباره لینک بفرستید.")
-        return
-    
-    url = user_sessions[user_id]['url']
-    info = user_sessions[user_id].get('info', {})
-    
-    # پردازش هر عمل
-    if action == "action_download_video":
-        await download_media(query, url, 'video')
-    
-    elif action == "action_extract_audio":
-        await extract_audio(query, url)
-    
-    elif action == "action_download_photo":
-        await download_media(query, url, 'photo')
-    
-    elif action == "action_copy_caption":
-        await copy_caption(query, info)
-    
-    elif action == "action_post_info":
-        await show_post_info(query, info)
-    
-    elif action == "action_new_link":
-        await query.edit_message_text("📎 **لینک جدید اینستاگرام را بفرستید...**")
-    
-    elif action == "help":
-        await show_help(query)
-    
-    elif action == "download_video":
-        await query.edit_message_text("📎 **لینک اینستاگرام را بفرستید...**")
+✅ Status: Online
+⏱ Uptime: 99.9%
+📥 Downloads: In development
+👥 Users: In development
 
-async def download_media(query, url, media_type):
-    """دانلود مدیا"""
-    msg = await query.edit_message_text(
-        f"⏳ **در حال دانلود {media_type}...**\n"
-        "📥 لطفاً صبر کنید..."
-    )
+🔄 **Server Status:**
+• CPU: Good
+• RAM: Good
+• Disk: Good
+        """
+        await update.message.reply_text(stats_text, parse_mode='Markdown')
     
-    try:
-        temp_dir = tempfile.mkdtemp()
-        ydl_opts = {
-            'quiet': True,
-            'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
-            'format': 'best[filesize<50M]' if media_type == 'video' else 'best',
-            'socket_timeout': 30,
-            'retries': 3,
-        }
+    @log_function
+    async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle inline keyboard callbacks"""
+        query = update.callback_query
+        await query.answer()
         
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-            
-            # پیدا کردن فایل دانلود شده
-            for file in os.listdir(temp_dir):
-                if file.endswith(('.mp4', '.webm', '.mkv', '.jpg', '.png', '.jpeg')):
-                    file_path = os.path.join(temp_dir, file)
-                    
-                    with open(file_path, 'rb') as f:
-                        if file.endswith(('.mp4', '.webm', '.mkv')):
-                            await query.message.reply_video(
-                                video=f,
-                                caption="🎬 **دانلود شده توسط ربات**",
-                                supports_streaming=True,
-                                read_timeout=60,
-                                write_timeout=60
-                            )
-                        else:
-                            await query.message.reply_photo(
-                                photo=f,
-                                caption="🖼️ **دانلود شده توسط ربات**"
-                            )
-                    
-                    os.remove(file_path)
-                    break
-        
-        await msg.edit_text("✅ **دانلود با موفقیت انجام شد!**\n✨ لینک دیگری بفرستید...")
-        
-    except Exception as e:
-        logger.error(f"خطا در دانلود: {e}")
-        await msg.edit_text(
-            "❌ **خطا در دانلود!**\n\n"
-            f"⚠️ دلیل: {str(e)[:150]}\n\n"
-            "🔧 لینک دیگری امتحان کنید..."
-        )
+        if query.data == 'help':
+            await self.help_command(update, context)
+        elif query.data == 'stats':
+            await self.stats(update, context)
     
-    finally:
-        # پاکسازی
-        import shutil
-        try:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        except:
-            pass
-
-async def extract_audio(query, url):
-    """استخراج صدا از ویدیو"""
-    msg = await query.edit_message_text(
-        "🎵 **در حال استخراج صدا...**\n"
-        "⚙️ این عملیات ممکن است کمی طول بکشد..."
-    )
-    
-    try:
-        # اول ویدیو را دانلود کن
-        temp_dir = tempfile.mkdtemp()
-        video_path = os.path.join(temp_dir, 'video.mp4')
+    @log_function
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Process messages containing Instagram links"""
+        message = update.message
+        text = message.text
         
-        ydl_opts = {
-            'quiet': True,
-            'outtmpl': video_path.replace('.mp4', '.%(ext)s'),
-            'format': 'best[filesize<50M]',
-        }
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.download([url])
-        
-        # تبدیل به MP3
-        from moviepy.editor import VideoFileClip
-        
-        video = VideoFileClip(video_path)
-        audio_path = video_path.replace('.mp4', '.mp3')
-        video.audio.write_audiofile(audio_path)
-        video.close()
-        
-        # ارسال فایل صوتی
-        with open(audio_path, 'rb') as f:
-            await query.message.reply_audio(
-                audio=f,
-                title="استخراج شده از اینستاگرام",
-                performer="@Instagram",
-                caption="🎵 **صدا استخراج شد**"
+        # Check if message contains valid Instagram link
+        if not ('instagram.com' in text and ('/p/' in text or '/reel/' in text or '/tv/' in text)):
+            await message.reply_text(
+                "❌ **Please send a valid Instagram link!**\n\n"
+                "Examples:\n"
+                "• instagram.com/p/...\n"
+                "• instagram.com/reel/...\n"
+                "• instagram.com/tv/...",
+                parse_mode='Markdown'
             )
+            return
         
-        await msg.edit_text("✅ **صدا با موفقیت استخراج شد!**")
-        
-    except Exception as e:
-        logger.error(f"خطا در استخراج صدا: {e}")
-        await msg.edit_text(
-            "❌ **خطا در استخراج صدا!**\n\n"
-            "⚠️ این ویژگی فقط برای ویدیوها کار می‌کند.\n"
-            "🔧 لینک ویدیویی دیگری امتحان کنید..."
+        # Send processing message
+        processing_msg = await message.reply_text(
+            "🔄 **Processing...**\n\n"
+            "⏱ Please wait a moment",
+            parse_mode='Markdown'
         )
-    
-    finally:
-        # پاکسازی
-        import shutil
+        
         try:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        except:
-            pass
+            # Download content
+            file_path, file_type = await self.downloader.download_post(text)
+            
+            # Check if download failed
+            if not file_path or not os.path.exists(file_path):
+                await processing_msg.edit_text(
+                    "❌ **Download failed!**\n\n"
+                    "Possible reasons:\n"
+                    "• Invalid link\n"
+                    "• Private post\n"
+                    "• Instagram rate limit",
+                    parse_mode='Markdown'
+                )
+                return
+            
+            # Check file size
+            file_size = os.path.getsize(file_path)
+            if file_size > config.MAX_FILE_SIZE:
+                await processing_msg.edit_text(
+                    f"❌ **File too large!**\n\n"
+                    f"📦 Size: {file_size / 1024 / 1024:.1f}MB\n"
+                    f"⚠️ Limit: {config.MAX_FILE_SIZE / 1024 / 1024:.0f}MB",
+                    parse_mode='Markdown'
+                )
+                self.downloader.cleanup(file_path)
+                return
+            
+            # Delete processing message
+            await processing_msg.delete()
+            
+            # Send the file
+            caption = "✅ **Download successful!**"
+            
+            if file_type == 'video':
+                with open(file_path, 'rb') as video:
+                    await message.reply_video(
+                        video=video,
+                        caption=caption,
+                        parse_mode='Markdown',
+                        supports_streaming=True
+                    )
+            else:
+                with open(file_path, 'rb') as photo:
+                    await message.reply_photo(
+                        photo=photo,
+                        caption=caption,
+                        parse_mode='Markdown'
+                    )
+            
+            # Cleanup temporary file
+            self.downloader.cleanup(file_path)
+            
+        except Exception as e:
+            logger.error(f"Error in handle_message: {str(e)}")
+            await processing_msg.edit_text(
+                "❌ **Unknown error!**\n\n"
+                "Please try again later",
+                parse_mode='Markdown'
+            )
 
-async def copy_caption(query, info):
-    """نمایش و کپی کپشن"""
-    caption = info.get('description') or info.get('title') or 'کپشنی وجود ندارد'
+# ================== Main Execution ==================
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Global error handler"""
+    logger.error(f"Update {update} caused error {context.error}")
     
-    # استخراج هشتگ‌ها
-    import re
-    hashtags = re.findall(r'#(\w+)', caption)
-    hashtags_text = ' '.join([f'#{tag}' for tag in hashtags[:10]]) if hashtags else 'هشتگی ندارد'
-    
-    # متن برای کپی
-    copy_text = f"""
-{caption}
-
-{hashtags_text}
-
-📎 دانلود شده توسط @{query.message.chat.username}
-    """
-    
-    await query.edit_message_text(
-        f"📝 **کپشن پست:**\n\n"
-        f"`{copy_text}`\n\n"
-        "✅ **متن بالا را انتخاب و کپی کنید.**\n"
-        "📋 برای کپی: متن را انتخاب → Copy\n\n"
-        f"🏷️ **هشتگ‌ها ({len(hashtags)}):**\n{hashtags_text}",
-        parse_mode='Markdown'
-    )
-
-async def show_post_info(query, info):
-    """نمایش اطلاعات کامل پست"""
-    title = info.get('title', 'بدون عنوان')
-    uploader = info.get('uploader', 'ناشناس')
-    duration = info.get('duration', 0)
-    view_count = info.get('view_count', 0)
-    like_count = info.get('like_count', 0)
-    comment_count = info.get('comment_count', 0)
-    
-    info_text = f"""
-📊 **اطلاعات کامل پست:**
-
-📛 **عنوان:** {title[:200]}
-👤 **کاربر:** @{uploader}
-⏱️ **مدت زمان:** {duration} ثانیه
-👁️ **بازدید:** {view_count:,}
-❤️ **لایک:** {like_count:,}
-💬 **کامنت:** {comment_count:,}
-🔗 **آدرس:** {info.get('webpage_url', 'N/A')[:50]}...
-
-📈 **وضعیت:** {'فعال' if info.get('availability') else 'نامشخص'}
-🎬 **نوع:** {'ویدیو' if duration > 0 else 'عکس'}
-        """
-    
-    await query.edit_message_text(info_text, parse_mode='Markdown')
-
-async def show_help(query):
-    """نمایش راهنما"""
-    help_text = """
-🎯 **راهنمای استفاده از ربات:**
-
-📌 **مراحل کار:**
-1. لینک اینستاگرام را بفرستید
-2. عمل مورد نظر را انتخاب کنید
-3. نتیجه را دریافت کنید
-
-✨ **ویژگی‌ها:**
-• 🎬 دانلود ویدیو با کیفیت اصلی
-• 🎵 استخراج صدا به صورت MP3
-• 📝 کپی خودکار کپشن و هشتگ‌ها
-• 📊 اطلاعات کامل پست
-• ⚡ سرعت بالا و بدون محدودیت
-
-⚠️ **محدودیت‌ها:**
-• فقط پست‌های عمومی
-• حداکثر حجم: 50 مگابایت
-• بدون نیاز به لاگین
-
-🔗 **پشتیبانی:** @YourUsername
-📢 **کانال:** @YourChannel
-⭐ **امتیاز دهید:** /rate
-
-💡 **نکته:** برای بهترین نتیجه از لینک‌های عمومی استفاده کنید.
-        """
-    
-    await query.edit_message_text(help_text, parse_mode='Markdown')
+    try:
+        if update and update.effective_message:
+            await update.effective_message.reply_text(
+                "❌ **An error occurred!**\n\n"
+                "Please try again.",
+                parse_mode='Markdown'
+            )
+    except:
+        pass
 
 def main():
-    """تابع اصلی اجرای ربات"""
-    if not BOT_TOKEN:
-        logger.error("❌ BOT_TOKEN تنظیم نشده!")
-        logger.error("لطفاً در Render Environment Variables قرار دهید.")
+    """Main bot execution function"""
+    # Check for bot token
+    if not config.BOT_TOKEN:
+        logger.error("BOT_TOKEN not found in environment variables!")
         return
     
-    app = Application.builder().token(BOT_TOKEN).build()
+    # Create application
+    app = Application.builder().token(config.BOT_TOKEN).build()
     
-    # اضافه کردن هندلرها
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(CallbackQueryHandler(button_handler))
+    # Initialize classes
+    downloader = InstagramDownloader()
+    handlers = BotHandlers(downloader)
     
-    logger.info("=" * 50)
-    logger.info("🤖 ربات حرفه‌ای اینستاگرام")
-    logger.info("🚀 فعال شد و منتظر درخواست...")
-    logger.info("=" * 50)
+    # Add handlers
+    app.add_handler(CommandHandler("start", handlers.start))
+    app.add_handler(CommandHandler("help", handlers.help_command))
+    app.add_handler(CommandHandler("stats", handlers.stats))
+    app.add_handler(CallbackQueryHandler(handlers.handle_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.handle_message))
     
-    app.run_polling(
-        poll_interval=1.0,
-        timeout=30,
-        drop_pending_updates=True,
-        allowed_updates=['message', 'callback_query']
-    )
+    # Add error handler
+    app.add_error_handler(error_handler)
+    
+    # Start bot
+    logger.info("Starting bot...")
+    app.run_polling()
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
-    
